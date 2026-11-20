@@ -1,6 +1,8 @@
 import os
 import re
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from flask import Flask, request, abort
 
@@ -33,6 +35,7 @@ configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
 DATA_FILE = "madi_stats.json"
+KST = ZoneInfo("Asia/Seoul")
 
 WELCOME_MESSAGE = """𓆩 𝑾𝑬𝑳𝑪𝑶𝑴𝑬 𓆪
  🕰️ 𝐕𝐄𝐋𝐕𝐄𝐓 𝐇𝐎𝐔𝐑 🥀
@@ -64,7 +67,7 @@ WELCOME_MESSAGE = """𓆩 𝑾𝑬𝑳𝑪𝑶𝑴𝑬 𓆪
 ┈┈┈┈┈ 𓆩 🗝️ 𓆪 ┈┈┈┈┈
 
 𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𝐕𝐄𝐋𝐕𝐄𝐓 𝐇𝐎𝐔𝐑
-〜 당신의 새로운 시간이 시작됩니다. 〜"""
+〜 당신의 새로운 시간이 시작됩니다 〜"""
 
 # 문자열(1개 말풍선) 또는 리스트(최대 5개 연속 말풍선/스티커 딕셔너리 혼합 지원)
 KEYWORD_REPLIES = {
@@ -140,11 +143,16 @@ KEYWORD_REPLIES = {
 }
 
 
+def get_today_kst() -> str:
+    return datetime.now(KST).strftime("%Y-%m-%d")
+
+
 def load_stats() -> dict:
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
         except Exception:
             return {}
     return {}
@@ -156,6 +164,26 @@ def save_stats(stats: dict):
 
 
 madi_stats = load_stats()
+
+
+def ensure_today_members(room_key: str) -> dict:
+    """한국 시간(KST) 오늘 날짜 기준으로 채팅방 마딧수 데이터를 보장하고 날짜가 바뀌면 초기화"""
+    today = get_today_kst()
+    room_entry = madi_stats.get(room_key)
+
+    if not isinstance(room_entry, dict) or room_entry.get("date") != today:
+        madi_stats[room_key] = {
+            "date": today,
+            "members": {},
+        }
+        save_stats(madi_stats)
+
+    members = madi_stats[room_key].get("members")
+    if not isinstance(members, dict):
+        madi_stats[room_key]["members"] = {}
+        save_stats(madi_stats)
+
+    return madi_stats[room_key]["members"]
 
 
 def count_valid_madi(text: str) -> int:
@@ -252,22 +280,21 @@ def handle_message(event):
     user_id = getattr(event.source, "user_id", None)
     room_key = get_source_id(event)
 
-    if room_key not in madi_stats:
-        madi_stats[room_key] = {}
+    members_data = ensure_today_members(room_key)
+    today_str = get_today_kst()
 
     if user_text == "/전체랭킹":
-        room_data = madi_stats.get(room_key, {})
-        if not room_data:
-            reply_content(event.reply_token, "📊 아직 집계된 마딧수 기록이 없습니다.")
+        if not members_data:
+            reply_content(event.reply_token, f"📊 {today_str} 아직 집계된 오늘의 마딧수 기록이 없습니다.")
             return
 
         sorted_members = sorted(
-            room_data.items(),
+            members_data.items(),
             key=lambda item: item[1]["count"],
             reverse=True,
         )
 
-        lines = ["🏆 𝐕𝐄𝐋𝐕𝐄𝐓 𝐇𝐎𝐔𝐑 전체 마딧수 랭킹", "┈┈┈┈┈ 𓆩 🥀 𓆪 ┈┈┈┈┈"]
+        lines = [f"🏆 𝐕𝐄𝐋𝐕𝐄𝐓 𝐇𝐎𝐔𝐑 오늘({today_str}) 마딧수 랭킹", "┈┈┈┈┈ 𓆩 🥀 𓆪 ┈┈┈┈┈"]
         for idx, (_, info) in enumerate(sorted_members[:20], start=1):
             medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"{idx}위"
             lines.append(f"{medal} {info['name']} : {info['count']}마디")
@@ -280,17 +307,16 @@ def handle_message(event):
             reply_content(event.reply_token, "사용자 정보를 확인할 수 없습니다.")
             return
 
-        room_data = madi_stats.get(room_key, {})
-        if user_id not in room_data or room_data[user_id]["count"] == 0:
+        if user_id not in members_data or members_data[user_id]["count"] == 0:
             name = fetch_display_name(event, user_id)
             reply_content(
                 event.reply_token,
-                f"🥀 {name}님의 마딧수 기록\n• 누적 마딧수 : 0마디\n• 현재 순위 : 순위 없음",
+                f"🥀 {name}님의 오늘({today_str}) 마딧수 기록\n• 오늘 마딧수 : 0마디\n• 현재 순위 : 순위 없음",
             )
             return
 
         sorted_members = sorted(
-            room_data.items(),
+            members_data.items(),
             key=lambda item: item[1]["count"],
             reverse=True,
         )
@@ -299,13 +325,13 @@ def handle_message(event):
             (idx for idx, (uid, _) in enumerate(sorted_members, start=1) if uid == user_id),
             None,
         )
-        my_info = room_data[user_id]
+        my_info = members_data[user_id]
         total_members = len(sorted_members)
 
         reply_content(
             event.reply_token,
-            f"🥀 {my_info['name']}님의 마딧수 기록\n"
-            f"• 누적 마딧수 : {my_info['count']}마디\n"
+            f"🥀 {my_info['name']}님의 오늘({today_str}) 마딧수 기록\n"
+            f"• 오늘 마딧수 : {my_info['count']}마디\n"
             f"• 현재 순위 : 전체 {total_members}명 중 {rank}위",
         )
         return
@@ -317,10 +343,10 @@ def handle_message(event):
     if user_id and not user_text.startswith("/"):
         added_madi = count_valid_madi(user_text)
         if added_madi > 0:
-            if user_id not in madi_stats[room_key]:
+            if user_id not in members_data:
                 display_name = fetch_display_name(event, user_id)
-                madi_stats[room_key][user_id] = {"name": display_name, "count": 0}
-            madi_stats[room_key][user_id]["count"] += added_madi
+                members_data[user_id] = {"name": display_name, "count": 0}
+            members_data[user_id]["count"] += added_madi
             save_stats(madi_stats)
 
 
